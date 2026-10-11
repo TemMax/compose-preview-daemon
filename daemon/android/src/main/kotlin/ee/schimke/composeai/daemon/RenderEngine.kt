@@ -1151,11 +1151,20 @@ class RenderEngine(
               val extensionContextData =
                 ExtensionContextData.of(*artifactContextData.toTypedArray())
               val productStore = RecordingDataProductStore()
+              val postCaptureAllowlist = PostCaptureGate.allowlistFromSystemProperties()
               for (ext in builtDataArtifactExtensions) {
                 if (ext !is PostCaptureProcessor) continue
                 // On-demand processors (the multi-second `compose/figma-svg` export) run only when
-                // a client asked for their kind — see [PostCaptureGate].
-                if (!PostCaptureGate.shouldRun(ext.id.value, spec.requestedDataKinds)) {
+                // a client asked for their kind; with a `postCaptureKinds` allowlist every
+                // processor is on demand — see [PostCaptureGate].
+                if (
+                  !PostCaptureGate.shouldRun(
+                    kind = ext.id.value,
+                    requested = spec.requestedDataKinds,
+                    onDemandKinds = PostCaptureGate.ON_DEMAND_KINDS,
+                    allowlist = postCaptureAllowlist,
+                  )
+                ) {
                   postCaptureMetrics[PostCaptureGate.skippedMetricKey(ext.id.value)] = 0L
                   continue
                 }
@@ -2065,8 +2074,10 @@ class RenderEngine(
           wrapHeight = false,
           previewId = null,
           outputBaseName = tmpBase,
-          // This render exists to produce the layered SVG, so the on-demand export must run.
-          requestedDataKinds = spec.requestedDataKinds?.plus(ComposeFigmaSvgProduct.KIND),
+          // This render exists to produce the layered SVG, so the on-demand export must run —
+          // also under a `postCaptureKinds` allowlist that does not name it, which a `null` set
+          // would not guarantee.
+          requestedDataKinds = spec.requestedDataKinds.orEmpty() + ComposeFigmaSvgProduct.KIND,
         ),
       requestId = requestId,
       classLoader = classLoader,
@@ -2246,19 +2257,14 @@ class RenderEngine(
   }
 
   /**
-   * Lazily reads the daemon's `previews.json` via [PreviewIndex.loadFromFile] using the
-   * `composeai.daemon.previewsJsonPath` system property the gradle plugin populates. Falls back to
-   * [PreviewIndex.empty] when the property is unset (harness / fake-mode tests) — callers that need
-   * a real index check for an empty result and emit a structured error.
+   * Reads the daemon's `previews.json` via [PreviewIndexFileCache] using the
+   * `composeai.daemon.previewsJsonPath` system property the gradle plugin populates. The cache
+   * decodes the file once and reuses it until the file changes, so the several lookups a render
+   * makes no longer each parse the whole manifest. Falls back to [PreviewIndex.empty] when the
+   * property is unset (harness / fake-mode tests) — callers that need a real index check for an
+   * empty result and emit a structured error.
    */
-  private fun loadPreviewIndexLazily(): PreviewIndex {
-    val path = System.getProperty(PreviewIndex.PREVIEWS_JSON_PATH_PROP)
-    return if (path.isNullOrBlank()) {
-      PreviewIndex.empty()
-    } else {
-      PreviewIndex.loadFromFile(java.nio.file.Paths.get(path))
-    }
-  }
+  private fun loadPreviewIndexLazily(): PreviewIndex = PreviewIndexFileCache.fromSystemProperty()
 
   private fun ScrollCaptureDto.toRendererScrollCapture():
     ee.schimke.composeai.renderer.ScrollCapture =
