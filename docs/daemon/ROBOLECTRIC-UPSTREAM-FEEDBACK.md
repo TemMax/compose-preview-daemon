@@ -413,6 +413,13 @@ looper clock are independent; establish which layer advances the looper clock du
 capture. **Validation needed:** a single-test reproducer with an `AndroidView` whose
 `onDraw` reads `SystemClock`, outside the daemon.
 
+Carried-document replay had a separate clock mismatch in our connector:
+`RemoteComposeIrReplay` used the document source's default `SYSTEM` clock while the
+live capture path selected `ROBOLECTRIC_UPTIME`. Both now select the same host clock;
+production hosts retain `SYSTEM`. The carried-player regression renders with a fixed
+32 ms held-clock advance and preserves the toggle's persistent-state checks for all
+three players. This is our integration fix, not evidence of an upstream clock defect.
+
 ## R12 — Resolved fonts are not proof of emitted glyphs
 
 **Owner:** our Figma SVG exporter. **Status:** regression fix prepared (2026-10-13),
