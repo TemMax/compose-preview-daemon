@@ -46,6 +46,7 @@ unmeasured. Evidence confidence is separate from priority.
 | 11 | **P3 · R11 — two input clocks in a held Compose session** | Fixed locally (input dropped by a hosted `View` player); upstream value is documentation, not a speedup. | Any Robolectric Compose test that injects input into an `AndroidView` whose `View` reads `SystemClock`, once the looper clock and `mainClock` have drifted. | High confidence in mechanism (measured, before/after test); ownership split across Compose ui-test, Robolectric and Roborazzi, not established. | Reduce to a one-file Robolectric + Compose test before deciding where, if anywhere, to report it. |
 | 12 | **P3 · R13 — API 37 needs espresso-core 3.7.0+** | Blocking at API 37 until the floor is on the classpath; fixed by compose-ai-tools injecting the floor. | Every Robolectric API 37 test that injects input through Espresso before 3.7. | Confirmed end to end; the owner is AndroidX Test, which already fixed it in 3.7.0. | None beyond suggesting a note in Robolectric's API 37 release notes. |
 | 13 | **P3 · R14 — caller-scoped wall clock for instrumented code** | Fixed locally with a shadow of `ShadowSystem` plus a stack-walk caller check; upstream value is a supported way to give instrumented app code a fixed wall clock. | Any Robolectric screenshot test of a component that formats `System.currentTimeMillis()`; ordinary app code is uninstrumented, so it reads the host clock today. | High confidence in mechanism (source + end-to-end tests); no upstream discussion yet. | Ask whether a configurable wall-clock offset, or a caller-aware `Interceptor` hook, would be accepted. |
+| 14 | **P3 · R15 — no hook to choose the sandbox classpath** | Medium: the Bazel/bundle lanes rendered on the daemon's Compose instead of the app's; worked around via the context loader. | Narrow: embedders whose sandbox classpath differs from the JVM's. | High confidence in source observation; workaround tested in-process. | Propose an extra-classpath option on `InstrumentationConfiguration`. |
 
 ## Applicability beyond the daemon
 
@@ -509,6 +510,28 @@ this investigation; their full application export still needs validation with th
   `TimeText` plus a consumer label, byte-identical PNGs a second apart, a `fixedTime=off` control
   that differs) and `ConsumerClockDaemonRenderTest` (real `RobolectricHost` render). No upstream
   issue filed.
+
+## R15 — No supported way to choose the sandbox's classpath
+
+- **Category:** embedding API gap. **Owner:** our daemon for the workaround; the missing hook is
+  Robolectric's. Not a bug.
+- **Evidence/version:** Robolectric 4.17 bytecode, 2026-10-15. `AndroidSandbox$SdkSandboxClassLoader`
+  calls `SandboxClassLoader(InstrumentationConfiguration, ResourceProvider, ClassInstrumentor)`,
+  which takes the **thread context loader** as parent; the sandbox's URLs are that parent's
+  `getURLs()` when it is a `URLClassLoader`, else `java.class.path`. An acquired class's bytes come
+  from the SDK jar's `UrlResourceProvider`, then `URLClassLoader.getResourceAsStream` — the
+  parent's `getResource` first. There is no configuration for "these jars before the JVM classpath".
+- **Impact:** the daemon's Bazel/bundle lanes put an app's own (possibly newer) Compose on a child
+  loader, and the sandbox kept defining the daemon's bundled Compose
+  (compose-ai-tools#6016; docs/daemon/CLASSLOADER.md § "Whose Compose runs").
+- **Current workaround:** `RobolectricHost.runJUnit` sets the context loader to an
+  `AppComposeFirstLoader` (a plain `ClassLoader`, so Robolectric still parses `java.class.path`)
+  whose `getResource` answers `androidx/` from the app's jars first. Correct only because the
+  sandbox is built on that thread and reads bytes through the parent; both are implementation
+  details. `AppComposeSandboxTest` / `AppComposeEscapeHatchTest` pin them.
+- **Proposed upstream change:** an `InstrumentationConfiguration` (or `SandboxBuilder`) option
+  naming extra classpath entries searched before the parent for acquired classes.
+- **Validation status:** workaround tested in-process; no upstream issue filed.
 
 ## How to turn an item into upstream feedback
 
