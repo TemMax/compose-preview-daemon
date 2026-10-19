@@ -2912,6 +2912,7 @@ open class RobolectricHost(
       if (System.getProperty("roborazzi.test.record") == null) {
         System.setProperty("roborazzi.test.record", "true")
       }
+      redirectRoborazziResults()
 
       // Missing-resource fallback — same opt-in the one-shot `RenderEngine.render` path reads (the
       // detached live / serve daemons set it; see
@@ -3933,6 +3934,7 @@ open class RobolectricHost(
       val previousContext = Thread.currentThread().contextClassLoader
       Thread.currentThread().contextClassLoader = classLoader
       try {
+        ee.schimke.composeai.renderer.PreviewHostTheme.suppressHostTitle()
         rule.apply(statement, description).evaluate()
       } catch (t: Throwable) {
         // Rule lifecycle failed (e.g. setContent threw; ActivityScenario couldn't launch). If

@@ -237,6 +237,8 @@ class RenderEngine(
     // previews per JVM, so the flag is a whole-session property here rather than a per-request one;
     // re-applying it per render is idempotent and costs a `getProperty`. Unset (default) is silent.
     LinkBufferComposer.applyAndDescribe(classLoader)?.let(System.err::println)
+    // Before the mode dispatch below: the scroll and long-SVG paths capture through Roborazzi too.
+    redirectRoborazziResults()
     // Issue #1528 — scroll-scenario dispatch. When the dispatcher's `data/fetch` re-render path
     // queues `mode=scroll-long` / `scroll-gif`, route into the renderer's scroll handlers
     // (`renderer.handleLongCapture` / `renderer.handleGifCapture`) instead of the default
@@ -1395,6 +1397,7 @@ class RenderEngine(
       System.err.println(
         "compose-ai-daemon: [render] phase=evaluateRule.start outputBaseName=${spec.outputBaseName}"
       )
+      ee.schimke.composeai.renderer.PreviewHostTheme.suppressHostTitle()
       trace.section("render:evaluateRule") { rule.apply(statement, description).evaluate() }
       System.err.println(
         "compose-ai-daemon: [render] phase=evaluateRule.done outputBaseName=${spec.outputBaseName}"
@@ -1706,6 +1709,7 @@ class RenderEngine(
             }
         }
       }
+    ee.schimke.composeai.renderer.PreviewHostTheme.suppressHostTitle()
     rule.apply(statement, description).evaluate()
 
     if (!handled) {
@@ -1917,6 +1921,7 @@ class RenderEngine(
     val previousContext = Thread.currentThread().contextClassLoader
     Thread.currentThread().contextClassLoader = classLoader
     try {
+      ee.schimke.composeai.renderer.PreviewHostTheme.suppressHostTitle()
       rule.apply(statement, description).evaluate()
     } finally {
       Thread.currentThread().contextClassLoader = previousContext
@@ -2249,6 +2254,7 @@ class RenderEngine(
     val previousContext = Thread.currentThread().contextClassLoader
     Thread.currentThread().contextClassLoader = classLoader
     try {
+      ee.schimke.composeai.renderer.PreviewHostTheme.suppressHostTitle()
       rule.apply(statement, description).evaluate()
     } finally {
       Thread.currentThread().contextClassLoader = previousContext
@@ -3359,3 +3365,22 @@ fun RenderSpec.gutterHorizontalPx(): Int =
 fun RenderSpec.gutterVerticalPx(): Int =
   ee.schimke.composeai.renderer.captureGutterEdgePx(gutterTopDp, density) +
     ee.schimke.composeai.renderer.captureGutterEdgePx(gutterBottomDp, density)
+
+/**
+ * Points Roborazzi's per-capture result JSON (`build/test-results/roborazzi/results/…`, relative to
+ * the working directory by default) at a scratch directory deleted on exit, unless the launcher
+ * named one. The daemon's working directory is often the consumer's source tree — a Bazel workspace
+ * root, say — and nothing reads those files (compose-ai-tools#5945). The reporter itself stays the
+ * default one, which the deferred still-encoding path requires.
+ */
+internal fun redirectRoborazziResults() {
+  if (System.getProperty(ROBORAZZI_RESULT_DIR_PROPERTY) != null) return
+  synchronized(ROBORAZZI_RESULT_DIR_PROPERTY) {
+    if (System.getProperty(ROBORAZZI_RESULT_DIR_PROPERTY) != null) return
+    val dir = java.nio.file.Files.createTempDirectory("composeai-roborazzi-results").toFile()
+    Runtime.getRuntime().addShutdownHook(Thread { dir.deleteRecursively() })
+    System.setProperty(ROBORAZZI_RESULT_DIR_PROPERTY, dir.path)
+  }
+}
+
+private const val ROBORAZZI_RESULT_DIR_PROPERTY = "roborazzi.result.dir"
