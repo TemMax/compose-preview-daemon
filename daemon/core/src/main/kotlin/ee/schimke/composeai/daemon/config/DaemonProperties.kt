@@ -283,6 +283,7 @@ public object DaemonProperties {
     public const val BTA_OUTPUT_DIR: String = "composeai.daemon.bta.outputDir"
     public const val BTA_IC_WORKING_DIR: String = "composeai.daemon.bta.icWorkingDir"
     public const val BTA_INELIGIBILITY_REASON: String = "composeai.daemon.bta.ineligibilityReason"
+    public const val WARM_COMPILE: String = "composeai.daemon.warmCompile"
   }
 
   // ---- Lifecycle and timeouts ---------------------------------------------------------------
@@ -804,6 +805,16 @@ public object DaemonProperties {
       G_BTA,
     )
 
+  public val warmCompile: BooleanProperty =
+    BooleanProperty(
+      Names.WARM_COMPILE,
+      false,
+      "Whether `compileSources` first tries the warm compiler, which keeps the class path's " +
+        "compiler state across edits and recompiles only the changed files; edits it cannot " +
+        "prove local fall back to the Build Tools API (docs/daemon/WARM-COMPILE.md).",
+      G_BTA,
+    )
+
   /**
    * Every declared property, in the order the generated table renders them.
    *
@@ -874,6 +885,7 @@ public object DaemonProperties {
       btaOutputDir,
       btaIcWorkingDir,
       btaIneligibilityReason,
+      warmCompile,
     )
 
   /** [ALL] keyed by property name. */

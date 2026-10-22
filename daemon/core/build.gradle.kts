@@ -132,6 +132,31 @@ val generateDaemonVersionResource =
 
 sourceSets.main.get().resources.srcDir(generateDaemonVersionResource)
 
+// The warm compiler behind `composeai.daemon.warmCompile` (docs/daemon/WARM-COMPILE.md) ships
+// inside this jar as nested jars, one per supported compiler version. They link against
+// kotlin-compiler-embeddable's internals, so they must never land on the daemon's class path:
+// `WarmCompileService` extracts the one matching the launch descriptor's compiler and loads it next
+// to the Build Tools API impl jars.
+val warmCompilerImpl =
+  configurations.create("warmCompilerImpl") {
+    isCanBeConsumed = false
+    isCanBeResolved = true
+    isTransitive = false
+    attributes { attribute(Usage.USAGE_ATTRIBUTE, objects.named("warm-compiler-jars")) }
+  }
+
+dependencies {
+  warmCompilerImpl(project(path = ":daemon:warm-compiler-impl", configuration = "warmCompilerJars"))
+}
+
+val bundleWarmCompiler =
+  tasks.register<Sync>("bundleWarmCompiler") {
+    from(warmCompilerImpl) { into("ee/schimke/composeai/daemon/warm") }
+    into(layout.buildDirectory.dir("generated/warm-compiler"))
+  }
+
+sourceSets.main.get().resources.srcDir(bundleWarmCompiler)
+
 composeAiMavenPublishing {
   coordinates(
     artifactId = "daemon-core",
