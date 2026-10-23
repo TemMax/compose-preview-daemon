@@ -159,6 +159,82 @@ class CompileSourcesTest {
     }
   }
 
+  @Test(timeout = 10_000)
+  fun `compileWarmUp answers not ready when no BTA service is wired`() {
+    val rig = startServer(service = null)
+    try {
+      rig.handshake()
+      val result = rig.compileWarmUp()
+      assertEquals("false", result["ready"]?.jsonPrimitive?.content)
+      assertTrue(result["message"]!!.jsonPrimitive.content.contains("not configured"))
+    } finally {
+      rig.shutdown()
+    }
+  }
+
+  @Test(timeout = 10_000)
+  fun `compileWarmUp answers not ready when only the Build Tools API is wired`() {
+    val rig = startServer(service = StubService(outcome = { BtaCompileService.Outcome.Ok }))
+    try {
+      rig.handshake()
+      val result = rig.compileWarmUp()
+      assertEquals("false", result["ready"]?.jsonPrimitive?.content)
+      assertTrue(result["message"]!!.jsonPrimitive.content.contains("no warm compiler"))
+    } finally {
+      rig.shutdown()
+    }
+  }
+
+  @Test(timeout = 10_000)
+  fun `compileWarmUp warms off the read loop, with the sources it names, and answers once warm`() {
+    val home =
+      java.io.File(java.nio.file.Files.createTempDirectory("warm-up").toFile(), "Home.kt").apply {
+        writeText("package m\n")
+      }
+    val release = java.util.concurrent.CountDownLatch(1)
+    val warmedWith = LinkedBlockingQueue<List<String>>()
+    val warm =
+      object : WarmCompileService.WarmCompiler {
+        override fun compile(sources: List<String>): Map<String, Any?> = mapOf("status" to "ok")
+
+        override fun warmUp(sources: List<String>): Map<String, Any?> {
+          warmedWith.put(sources)
+          release.await()
+          return mapOf("status" to "ok")
+        }
+
+        override fun invalidate() {}
+      }
+    val service =
+      WarmCompileService(
+        StubService(outcome = { BtaCompileService.Outcome.Ok }),
+        { warm },
+        log = {},
+        warmUpSources = { listOf("/warm-up/WarmUp.kt") },
+        warmUpMaxPasses = 2,
+      )
+    val rig = startServer(service = service)
+    try {
+      rig.handshake()
+      val id = rig.sendRequest("compileWarmUp", """{"sources":["${home.path}"]}""")
+      assertEquals(listOf(home.path), warmedWith.poll(5, TimeUnit.SECONDS))
+      // The read loop still answers while the warm-up runs.
+      val other = rig.sendRequest("noSuchMethod")
+      val error = rig.pollUntil { it["id"]?.jsonPrimitive?.longOrNull == other }
+      assertNotNull("a request sent during the warm-up should be answered", error!!["error"])
+      assertNull(rig.pollUntil(timeoutMs = 200) { it["id"]?.jsonPrimitive?.longOrNull == id })
+
+      release.countDown()
+      val resp = rig.pollUntil { it["id"]?.jsonPrimitive?.longOrNull == id }
+      val result = resp!!["result"]!!.jsonObject
+      assertEquals("true", result["ready"]?.jsonPrimitive?.content)
+      assertEquals("2 passes over 1 files", result["message"]?.jsonPrimitive?.content)
+    } finally {
+      release.countDown()
+      rig.shutdown()
+    }
+  }
+
   // --- harness ------------------------------------------------------------------------------
 
   private class StubService(val outcome: () -> BtaCompileService.Outcome) : BtaCompileService {
@@ -279,6 +355,20 @@ class CompileSourcesTest {
         }
       val durationMs = result["durationMs"]?.jsonPrimitive?.longOrNull ?: error("missing duration")
       return CompileSourcesResponseDto(kind, errors, durationMs)
+    }
+
+    fun sendRequest(method: String, params: String = "{}"): Long {
+      val id = nextId++
+      writeFrame("""{"jsonrpc":"2.0","id":$id,"method":"$method","params":$params}""")
+      return id
+    }
+
+    fun compileWarmUp(): JsonObject {
+      val id = sendRequest("compileWarmUp")
+      val resp = pollUntil { it["id"]?.jsonPrimitive?.longOrNull == id }
+      assertNotNull("compileWarmUp response (id=$id) should arrive", resp)
+      assertNull("no error envelope expected", resp!!["error"])
+      return resp["result"]!!.jsonObject
     }
 
     fun shutdown() {

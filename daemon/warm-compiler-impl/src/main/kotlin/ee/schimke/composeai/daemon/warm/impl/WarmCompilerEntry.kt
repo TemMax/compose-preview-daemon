@@ -77,6 +77,65 @@ public class WarmCompilerEntry(config: Map<String, Any?>) : AutoCloseable {
       )
   }
 
+  /**
+   * One warm-up pass: compiles [sources] — the module's own files, or a generated one outside it —
+   * into the staging directory and installs nothing, building the class-path state, loading the
+   * library symbols they use and JIT-warming the pipeline. The class directory is only read, so a
+   * Gradle build may run alongside; one that writes classes drops the state again at the next pass
+   * or [compile], keeping only the warm JIT.
+   *
+   * Returns `ok`; `errors` (with `reason`) when [sources] do not compile, which keeps the state, as
+   * the library session is the same whatever the sources say; or `failed` (with `reason`) when the
+   * compiler itself did, which drops it. Always with `timings`.
+   */
+  @Synchronized
+  public fun warmUp(sources: List<String>): Map<String, Any?> {
+    val start = System.nanoTime()
+    // Taken before compiling, so a build that writes classes meanwhile still invalidates.
+    val current = classesFingerprint(classesDir)
+    if (current != fingerprint) {
+      dropState()
+      fingerprint = current
+    }
+    if (moduleClasses == null) moduleClasses = ModuleClasses.scan(classesDir)
+    stagingDir.deleteRecursively()
+    stagingDir.mkdirs()
+    val messages = Collector()
+    val exitCode = runPipeline(sources, messages)
+    stagingDir.deleteRecursively()
+    val timings = mapOf("warmUp" to System.nanoTime() - start)
+    if (messages.errors.isNotEmpty()) {
+      val errors = messages.errors.joinToString("; ") { "${it["message"]}" }
+      return result("errors", timings, "reason" to errors)
+    }
+    if (exitCode != ExitCode.OK) {
+      dropState()
+      return result("failed", timings, "reason" to "compiler exited $exitCode: ${messages.other}")
+    }
+    return result("ok", timings)
+  }
+
+  private fun runPipeline(sources: List<String>, messages: Collector): ExitCode {
+    val arguments =
+      parseCommandLineArguments<K2JVMCompilerArguments>(
+        listOf(
+          "-classpath",
+          (compileClasspath + classesDir.path).joinToString(File.pathSeparator),
+          "-d",
+          stagingDir.path,
+          "-jvm-target",
+          jvmTarget,
+          "-module-name",
+          moduleName,
+          "-no-stdlib",
+          "-no-reflect",
+        ) + sources
+      )
+    return WarmCliPipeline(K2JVMCompiler().defaultPerformanceManager, plugins, frontend)
+      .executeAndReturnPipeLineArtifact(arguments, Services.EMPTY, messages, keepAlive)
+      .exitCode
+  }
+
   @Synchronized
   public fun compile(sources: List<String>): Map<String, Any?> {
     val timings = LinkedHashMap<String, Long>()
@@ -99,27 +158,7 @@ public class WarmCompilerEntry(config: Map<String, Any?>) : AutoCloseable {
     stagingDir.deleteRecursively()
     stagingDir.mkdirs()
     val messages = Collector()
-    val exitCode =
-      timed("compile") {
-        val arguments =
-          parseCommandLineArguments<K2JVMCompilerArguments>(
-            listOf(
-              "-classpath",
-              (compileClasspath + classesDir.path).joinToString(File.pathSeparator),
-              "-d",
-              stagingDir.path,
-              "-jvm-target",
-              jvmTarget,
-              "-module-name",
-              moduleName,
-              "-no-stdlib",
-              "-no-reflect",
-            ) + sources
-          )
-        WarmCliPipeline(K2JVMCompiler().defaultPerformanceManager, plugins, frontend)
-          .executeAndReturnPipeLineArtifact(arguments, Services.EMPTY, messages, keepAlive)
-          .exitCode
-      }
+    val exitCode = timed("compile") { runPipeline(sources, messages) }
     if (messages.errors.isNotEmpty()) return result("errors", timings, "errors" to messages.errors)
     if (exitCode != ExitCode.OK) {
       // An internal error may have left the cached sessions half-updated; start over next time.

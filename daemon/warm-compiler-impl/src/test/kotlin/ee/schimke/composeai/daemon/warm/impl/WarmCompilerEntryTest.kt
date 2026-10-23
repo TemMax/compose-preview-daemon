@@ -154,6 +154,73 @@ class WarmCompilerEntryTest {
     assertTrue(timings(result).containsKey("index"))
   }
 
+  @Test
+  fun `a warm-up builds the class-path state without touching the classes`() {
+    val before = classes.walkTopDown().filter { it.isFile }.associate { it.path to it.readBytes() }
+    val warmUp =
+      File(root, "warm-up/WarmUp.kt").apply {
+        parentFile.mkdirs()
+        writeText(
+          """
+          package warmup
+          import androidx.compose.runtime.Composable
+          @Composable private fun WarmUp(items: List<String>) { items.forEach { println(it) } }
+          """
+            .trimIndent()
+        )
+      }
+    @Suppress("UNCHECKED_CAST")
+    val result =
+      entry.javaClass.getMethod("warmUp", List::class.java).invoke(entry, listOf(warmUp.path))
+        as Map<String, Any?>
+    assertEquals(result.toString(), "ok", result["status"])
+    val after = classes.walkTopDown().filter { it.isFile }.associate { it.path to it.readBytes() }
+    assertEquals(before.keys, after.keys)
+    for ((path, bytes) in before) assertArrayEquals(path, bytes, after.getValue(path))
+
+    // The edit after it reuses the state and the module index the warm-up built.
+    val screen = write("Screen.kt", screen("red"))
+    val edit = compile(screen)
+    assertEquals("ok", edit["status"])
+    assertFalse("index rebuilt after a warm-up", timings(edit).containsKey("index"))
+  }
+
+  @Test
+  fun `a warm-up file that does not compile reports why and keeps the state`() {
+    val broken =
+      File(root, "warm-up/Broken.kt").apply {
+        parentFile.mkdirs()
+        writeText("package warmup\nfun broken(): Int = missing()\n")
+      }
+    val result = warmUp(broken)
+    assertEquals("errors", result["status"])
+    assertTrue(result["reason"].toString(), result["reason"].toString().contains("missing"))
+    val screen = write("Screen.kt", screen("red"))
+    val edit = compile(screen)
+    assertEquals("ok", edit["status"])
+    assertFalse("index rebuilt after a warm-up", timings(edit).containsKey("index"))
+  }
+
+  @Test
+  fun `a warm-up with the module's own file installs nothing`() {
+    val before = classes.walkTopDown().filter { it.isFile }.associate { it.path to it.readBytes() }
+    // The file as it stands on disk, edited since the classes were built.
+    val screen = write("Screen.kt", screen("green"))
+    repeat(3) { assertEquals("ok", warmUp(screen)["status"]) }
+    val after = classes.walkTopDown().filter { it.isFile }.associate { it.path to it.readBytes() }
+    assertEquals(before.keys, after.keys)
+    for ((path, bytes) in before) assertArrayEquals(path, bytes, after.getValue(path))
+
+    val edit = compile(write("Screen.kt", screen("red")))
+    assertEquals("ok", edit["status"])
+    assertFalse("index rebuilt after a warm-up", timings(edit).containsKey("index"))
+  }
+
+  @Suppress("UNCHECKED_CAST")
+  private fun warmUp(vararg files: File): Map<String, Any?> =
+    entry.javaClass.getMethod("warmUp", List::class.java).invoke(entry, files.map { it.path })
+      as Map<String, Any?>
+
   private fun compile(vararg files: File): Map<String, Any?> {
     @Suppress("UNCHECKED_CAST")
     return entry.javaClass

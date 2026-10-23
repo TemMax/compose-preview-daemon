@@ -88,6 +88,56 @@ Kotlin 2.5's Build Tools API caches compiler-plugin class loaders per `BuildSess
 compiler already loads the Compose plugin once; the Build Tools API fallback would need its
 `BuildSession` kept open across compiles to benefit (`daemon-bta`, compose-preview-contracts).
 
+## Warming up
+
+Left alone, the first `compileSources` of a daemon JVM pays for loading the warm compiler, building
+its class-path state and a cold JIT: 5.7 s on a one-preview desktop module, against about 0.3 s for
+the edits after it. A client that will send `compileSources` can have that paid before the first
+edit with `compileWarmUp` (PROTOCOL.md § 5): the daemon compiles the module files the request
+names — or, when it names none, a generated one-function Compose file of its own — into the warm
+compiler's staging directory, installs nothing, and answers when done.
+
+It runs passes of one file each, cycling through the named files, up to 60 passes or 6 s. Most of
+a cold edit is the JIT, which keeps improving for dozens of compiles, and compiling the files that
+will be edited also loads the library symbols they use, which a generated file never touches. On a
+Material 3 screen with 20 helper files (warm compiler alone, 4-core sandbox):
+
+| warm-up | took | edit 1 | edits 2–10 |
+| --- | ---: | ---: | ---: |
+| 2 passes, other files | 0.7–0.8 s | 252–280 ms | 145–225 ms |
+| 60 passes, other files of the module | 5.5–5.7 s | 177–196 ms | 106–148 ms |
+| 60 passes, the edited file | 8.1 s | 103–120 ms | 86–113 ms |
+
+A file that does not compile (mid-edit, say) is dropped from the cycle without losing the warm
+state; when none is left the generated file is used. The compiler's lock is taken per pass, and a
+`compileSources` that arrives stops the warm-up after the current pass, so an edit waits for one
+pass (about 0.1–0.3 s), never for the whole warm-up.
+
+The class directory is only read, so a client could compile through Gradle until the answer and
+switch then. The MCP server does not: an edit made during the warm-up goes to `compileSources` and
+waits. A Gradle build competes with the warm-up for the CPU, and one that writes classes before the
+first warm compile changes the class directory's fingerprint, so the warm compiler rebuilds its
+class-path state (only the JIT stays warm).
+
+| first edit through the MCP server, one-preview desktop module | compile | edit → pixels |
+| --- | ---: | ---: |
+| no warm-up | 5.7 s | 6.2 s |
+| warmed up (4.8–5.5 s in the background) | 0.65–0.70 s | 0.81–0.91 s |
+| warmed up, then a Gradle build wrote the classes | 1.24 s | 1.47 s |
+
+Six edits sent back to back from the first render, on a 4-core machine:
+
+| edit made during the warm-up | edit 1 | edit 2 | first six | warm-up took |
+| --- | ---: | ---: | ---: | ---: |
+| waits for it (what the MCP server does) | 5.8 s | 0.72 s | 13.1 s | 5.2 s |
+| compiles through Gradle until it answers | 5.7 s | 4.6 s | 16.0 s | 9.0 s |
+
+Only the warm compiler is warmed. Where it cannot run — a Kotlin version with no bundled jar, or
+`composeai.daemon.warmCompile=false` — `compileWarmUp` answers `ready: false` at once, and the first
+`compileSources` loads the Build Tools API as it always did. The request is opt-in so that a client
+that never compiles in process (VS Code with `composePreview.daemon.compileInProcess` off) never
+pays for a warm compiler it will not use, nor keeps its class-path state in memory.
+
 ## Results
 
 `SaveToPixelsRealModeTest` (harness, desktop real mode) times an editor save end to end on a
