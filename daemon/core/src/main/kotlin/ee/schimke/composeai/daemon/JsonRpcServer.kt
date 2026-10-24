@@ -521,6 +521,21 @@ public class JsonRpcServer(
    */
   private val overridesFinishLock = Any()
 
+  /**
+   * The host id of the plain (no-overrides) `renderNow` render in flight per preview id. A plain
+   * `renderNow` for a preview already in here is not submitted again: it marks the preview in
+   * [plainRendersAgain], and the in-flight render submits one more when it finishes. A burst of
+   * saves then costs one render in flight and one after it per preview, not one per save, all
+   * contending for the same sandbox. The one after it renders the latest classes, since a sandbox
+   * swaps its user classloader before the render that follows a swap. Guarded by [plainRenderLock].
+   */
+  private val plainRendersInFlight = HashMap<String, Long>()
+
+  /** Preview ids a plain `renderNow` asked for while [plainRendersInFlight] held one. */
+  private val plainRendersAgain = HashSet<String>()
+
+  private val plainRenderLock = Any()
+
   private val writerThread =
     Thread({ writerLoop() }, "compose-ai-daemon-writer").apply { isDaemon = false }
 
@@ -1138,7 +1153,14 @@ public class JsonRpcServer(
           }
         }
       }
-      submitRender(previewId, overrides, acceptedAt = now)
+      if (overrides == null) {
+        synchronized(plainRenderLock) {
+          if (previewId in plainRendersInFlight) plainRendersAgain.add(previewId)
+          else plainRendersInFlight[previewId] = submitRender(previewId, null, acceptedAt = now)
+        }
+      } else {
+        submitRender(previewId, overrides, acceptedAt = now)
+      }
       queued.add(previewId)
     }
     val result = RenderNowResult(queued = queued, rejected = rejected)
@@ -1151,7 +1173,12 @@ public class JsonRpcServer(
     COALESCED,
   }
 
-  private fun submitRender(previewId: String, overrides: PreviewOverrides?, acceptedAt: Long) {
+  /** Submits a render of [previewId] and returns its host request id. */
+  private fun submitRender(
+    previewId: String,
+    overrides: PreviewOverrides?,
+    acceptedAt: Long,
+  ): Long {
     val hostId = RenderHost.nextRequestId()
     hostIdToPreviewId[hostId] = previewId
     overrides?.let { hostIdToOverrides[hostId] = it }
@@ -1161,7 +1188,35 @@ public class JsonRpcServer(
     // submit() returns when the host returns a result; the watcher thread
     // demuxes the result back into renderFinished.
     submitRenderAsync(hostId, overrides)
+    return hostId
   }
+
+  /**
+   * The render with host id [hostId] finished or failed. When it was a plain render
+   * [plainRendersInFlight] tracks, hands its preview's slot to the render a `renderNow` asked for
+   * meanwhile, or frees it.
+   */
+  private fun plainRenderDone(hostId: Long) {
+    synchronized(plainRenderLock) {
+      val previewId = plainRendersInFlight.entries.firstOrNull { it.value == hostId }?.key ?: return
+      // Not dropped on shutdown: the follow-up is a `renderNow` already accepted, and shutdown
+      // drains accepted work (PROTOCOL.md § 3). [rendersOutstanding] counts it until it is here.
+      if (plainRendersAgain.remove(previewId)) {
+        plainRendersInFlight[previewId] =
+          submitRender(previewId, null, acceptedAt = System.currentTimeMillis())
+      } else {
+        plainRendersInFlight.remove(previewId)
+      }
+    }
+  }
+
+  /**
+   * Whether an accepted render has not finished: one in flight, or a plain `renderNow` waiting in
+   * [plainRendersAgain] for the render ahead of it. The latter matters between that render leaving
+   * [inFlightRenders] and [plainRenderDone] submitting its follow-up, when the first is empty.
+   */
+  private fun rendersOutstanding(): Boolean =
+    inFlightRenders.isNotEmpty() || synchronized(plainRenderLock) { plainRendersAgain.isNotEmpty() }
 
   private fun submitRenderAsync(hostId: Long, overrides: PreviewOverrides? = null) {
     // Fire-and-forget on a fresh thread (only O(visible) renders are queued at once); the watcher
@@ -1272,12 +1327,24 @@ public class JsonRpcServer(
           return
         }
       if (item == null) {
-        if (!running.get() && inFlightRenders.isEmpty()) return
+        if (!running.get() && !rendersOutstanding()) return
         continue
       }
       when (item) {
-        is RenderResult -> emitRenderFinished(item)
-        is RenderResultOrFailure.Failure -> emitRenderFailed(item)
+        // In a finally: a render whose notification failed must still hand its slot on, or the
+        // preview would never render again.
+        is RenderResult ->
+          try {
+            emitRenderFinished(item)
+          } finally {
+            plainRenderDone(item.id)
+          }
+        is RenderResultOrFailure.Failure ->
+          try {
+            emitRenderFailed(item)
+          } finally {
+            plainRenderDone(item.hostId)
+          }
         else -> System.err.println("compose-ai-daemon: unexpected render result type: $item")
       }
     }
@@ -3353,7 +3420,7 @@ public class JsonRpcServer(
     // DESIGN.md § 9 ("No mid-render cancellation"). We poll rather than
     // wait/notify because renders complete on submit threads we don't own.
     val drainDeadlineMs = System.currentTimeMillis() + DRAIN_TIMEOUT_MS
-    while (inFlightRenders.isNotEmpty() && System.currentTimeMillis() < drainDeadlineMs) {
+    while (rendersOutstanding() && System.currentTimeMillis() < drainDeadlineMs) {
       Thread.sleep(50)
     }
     sendResponse(req.id, JsonNull)
@@ -3582,7 +3649,7 @@ public class JsonRpcServer(
           // no-mid-render-cancellation invariant from DESIGN § 9 still applies.
           val deadline = System.currentTimeMillis() + classpathDirtyGraceMs
           while (System.currentTimeMillis() < deadline) {
-            if (outbound.isEmpty() && inFlightRenders.isEmpty()) break
+            if (outbound.isEmpty() && !rendersOutstanding()) break
             try {
               Thread.sleep(20)
             } catch (_: InterruptedException) {
@@ -3812,7 +3879,7 @@ public class JsonRpcServer(
     // no-mid-render-cancellation invariant even on EOF / unexpected exit
     // paths. Bounded by DRAIN_TIMEOUT_MS to avoid hanging the process.
     val deadline = System.currentTimeMillis() + DRAIN_TIMEOUT_MS
-    while (inFlightRenders.isNotEmpty() && System.currentTimeMillis() < deadline) {
+    while (rendersOutstanding() && System.currentTimeMillis() < deadline) {
       try {
         Thread.sleep(50)
       } catch (_: InterruptedException) {
